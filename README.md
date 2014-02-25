@@ -1,4 +1,4 @@
 gh-pulls
 ========
 
-Standalone GitHub pull requests management in Emacs
+Standalone GitHub pull requests management in Emacs FOR TESTIN'
