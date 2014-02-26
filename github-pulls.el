@@ -7,7 +7,7 @@
 
 ;; Package: github-pulls
 ;; Version: 20140118
-;; Package-Requires: ((gh "20140121") (deferred "0.3.1") (string-utils "20131022"))
+;; Package-Requires: ((gh "20140121") (deferred "0.3.1") (string-utils "20131022") (s "20131223"))
 ;; Keywords: github pull request gh pr
 
 ;; This code is licensed under the WTFPL.
@@ -34,6 +34,7 @@
 (require 'gh-issue-comments)
 (require 'easymenu)
 (require 'deferred)
+(require 's)
 (require 'string-utils)
 
 (defvar github-pulls-api (gh-api-v3 (gh-oauth-authenticator "default")))
@@ -79,9 +80,15 @@
 
 (defun github-pulls-dispatch-ret ()
   (interactive)
-  (cond ((equal major-mode 'github-pulls-menu-mode) (github-pulls-menu-select))))
+  (cond ((equal major-mode 'github-pulls-menu-mode) (github-pulls-menu-select))
+        ((equal major-mode 'github-pulls-issue-mode) nil)))
 
 (defvar github-pulls-menu-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map github-pulls-mode-map)
+    map))
+
+(defvar github-pulls-issue-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map github-pulls-mode-map)
     map))
@@ -98,7 +105,9 @@
   (setq font-lock-defaults '(github-pulls-mode-keywords))
   (setq truncate-lines t))
 
-(define-derived-mode github-pulls-menu-mode github-pulls-mode "GitHub Pulls")
+(define-derived-mode github-pulls-menu-mode github-pulls-mode "GitHub Pulls Navigation")
+
+(define-derived-mode github-pulls-issue-mode github-pulls-mode "GitHub Pulls PR")
 
 (easy-menu-define github-pulls-mode-menu github-pulls-mode-map
   "GitHub Pulls menu"
@@ -116,6 +125,7 @@
 (github-pulls-api-fn github-pulls-orgs gh-orgs-api gh-orgs-list)
 (github-pulls-api-fn github-pulls-org-repos gh-repos-api gh-repos-org-list org)
 (github-pulls-api-fn github-pulls-prs gh-pulls-api gh-pulls-list org repo)
+(github-pulls-api-fn github-pulls-pr gh-pulls-api gh-pulls-get org repo pr-id)
 (github-pulls-api-fn github-pulls-pr-comments gh-issue-comments-api
                      gh-issue-comments-list org repo pr-id)
 (github-pulls-api-fn github-pulls-pr-comment-get gh-issue-comments-api
@@ -163,7 +173,7 @@
   (puthash "issue" issue (github-pulls-nav-state)))
 
 (defun github-pulls-nav-level ()
-  (cond ((github-pulls-current-issue) "detail")
+  (cond ((github-pulls-current-issue) "issue-comments")
         ((github-pulls-current-repo) "issue")
         ((github-pulls-current-org) "repo")
         (t "org")))
@@ -193,7 +203,7 @@
   (insert "> ")
   (when (github-pulls-current-org) (insert (github-pulls-current-org) " > "))
   (when (github-pulls-current-repo) (insert (github-pulls-current-repo) " > "))
-  (when (github-pulls-current-issue) (insert (github-pulls-current-issue)))
+  (when (github-pulls-current-issue) (insert (format "PR #%d" (github-pulls-current-issue))))
   (newline)
   (newline))
 
@@ -201,7 +211,7 @@
   (let ((formatter (github-pulls-listing-format-string items)))
     (mapc
      (lambda (number)
-       (insert (format formatter number (elt items number)))
+       (insert (format formatter (+ 1 number) (elt items number)))
        (newline))
      (number-sequence 0 (- (length items) 1)))))
 
@@ -210,15 +220,26 @@
   (let ((magnitude (length (number-to-string (length items)))))
     (concat "%0" (number-to-string magnitude) "d: %s")))
 
+(defun github-pulls-prepare-menu-buffer ()
+  (github-pulls-switch-mode 'github-pulls-menu-mode)
+  (visual-line-mode)
+  (erase-buffer)
+  (github-pulls-draw-header)
+  (goto-char (point-max)))
+
+(defun github-pulls-prepare-issue-buffer ()
+  (github-pulls-switch-mode 'github-pulls-issue-mode)
+  (visual-line-mode)
+  (erase-buffer)
+  (github-pulls-draw-header)
+  (goto-char (point-max)))
+
 (defun github-pulls-draw-org-buffer (orgs)
   "Turn the current buffer into a fresh GitHub Pulls org select buffer."
   (let* ((inhibit-read-only t)
          (org-names (mapcar (lambda (org) (oref org :login)) orgs))
          (org-names-with-self (cons (gh-auth-get-username) org-names)))
-    (github-pulls-switch-mode 'github-pulls-menu-mode)
-    (erase-buffer)
-    (github-pulls-draw-header)
-    (goto-char (point-max))
+    (github-pulls-prepare-menu-buffer)
     (mapc 'github-pulls-inl '("Your Orgs" "=========" ""))
     (github-pulls-store-menu-items org-names-with-self)
     (github-pulls-draw-menu-listing org-names-with-self)))
@@ -228,10 +249,7 @@
   (let ((inhibit-read-only t)
         (repo-names (mapcar (lambda (repo) (oref repo :name)) repos))
         (header-string (format "%s Repos" (github-pulls-current-org))))
-    (github-pulls-switch-mode 'github-pulls-menu-mode)
-    (erase-buffer)
-    (github-pulls-draw-header)
-    (goto-char (point-max))
+    (github-pulls-prepare-menu-buffer)
     (mapc 'github-pulls-inl (list header-string (string-utils-string-repeat "=" (length header-string)) ""))
     (github-pulls-store-menu-items repo-names)
     (github-pulls-draw-menu-listing repo-names)))
@@ -239,19 +257,33 @@
 (defun github-pulls-draw-issue-buffer (issues)
   "Turn the current buffer into a fresh GitHub Pulls issue select buffer."
   (let ((inhibit-read-only t)
+        (issue-ids (mapcar (lambda (issue) (oref issue :number)) issues))
         (issue-titles (mapcar
-                       (lambda (issue) (format "%s: %s (PR #%d)"
+                       (lambda (issue) (format "%s: %s (Issue #%d)"
                                                (oref (oref issue :user) :login)
                                                (oref issue :title)
                                                (oref issue :number))) issues))
         (header-string (format "%s Open Pull Requests" (github-pulls-current-repo))))
-    (github-pulls-switch-mode 'github-pulls-menu-mode)
-    (erase-buffer)
-    (github-pulls-draw-header)
-    (goto-char (point-max))
+    (github-pulls-prepare-menu-buffer)
     (mapc 'github-pulls-inl (list header-string (string-utils-string-repeat "=" (length header-string)) ""))
-    (github-pulls-store-menu-items issue-titles)
+    (github-pulls-store-menu-items issue-ids)
     (github-pulls-draw-menu-listing issue-titles)))
+
+(defun github-pulls-draw-issue-comments-buffer (comments)
+  "Turn the current buffer into a fresh GitHub Pulls issue comments buffer."
+  (let ((inhibit-read-only t))
+    (github-pulls-prepare-issue-buffer)
+    (github-pulls-draw-current-issue-header)
+    (mapc 'github-pulls-draw-issue-comment comments)))
+
+(defun github-pulls-draw-current-issue-header ()
+  (let* ((issue (gethash "issue-data" *github-pulls-state*))
+         (header-string (format "%s: %s" (oref (oref issue :user) :login) (oref issue :title))))
+    (mapc 'github-pulls-inl (list header-string (string-utils-string-repeat "=" (length header-string)) ""))
+    (insert (oref issue :body))
+    (newline)))
+
+(defun github-pulls-draw-issue-comment (comment) nil)
 
 (defun github-pulls-init-org-buffer ()
   (deferred:$
@@ -280,19 +312,34 @@
       (lambda (issue-resp)
         (github-pulls-draw-issue-buffer (oref issue-resp :data))))))
 
+(defun github-pulls-init-issue-comments-buffer ()
+  (deferred:$
+    (deferred:call
+      (lambda ()
+        (let ((response (github-pulls-pr (github-pulls-current-org)
+                                         (github-pulls-current-repo)
+                                         (github-pulls-current-issue))))
+          (puthash "issue-data" (oref response :data) *github-pulls-state*)
+          (github-pulls-pr-comments (github-pulls-current-org)
+                                    (github-pulls-current-repo)
+                                    (number-to-string (github-pulls-current-issue))))))
+    (deferred:nextc it
+      (lambda (comment-resp)
+        (github-pulls-draw-issue-comments-buffer (oref comment-resp :data))))))
+
 (defun github-pulls-get-menu-item-at-point ()
   (beginning-of-line)
   (re-search-forward "[0-9]+" nil 'move)
   (let ((index (string-to-number (buffer-substring-no-properties (line-beginning-position) (point)))))
     (if index
-      (github-pulls-menu-item index)
+      (github-pulls-menu-item (- index 1))
       nil)))
 
 (defun github-pulls-init-current-nav-buffer ()
   (cond ((equal (github-pulls-nav-level) "org") (github-pulls-init-org-buffer))
         ((equal (github-pulls-nav-level) "repo") (github-pulls-init-repo-buffer))
         ((equal (github-pulls-nav-level) "issue") (github-pulls-init-issue-buffer))
-        ((equal (github-pulls-nav-level) "detail") nil)))
+        ((equal (github-pulls-nav-level) "issue-comments") (github-pulls-init-issue-comments-buffer))))
 
 ;; interactive commands
 
@@ -332,7 +379,7 @@
   (interactive)
   (cond ((equal (github-pulls-nav-level) "repo") (remhash "org" (github-pulls-nav-state)))
         ((equal (github-pulls-nav-level) "issue") (remhash "repo" (github-pulls-nav-state)))
-        ((equal (github-pulls-nav-level) "detail") (remhash "issue" (github-pulls-nav-state))))
+        ((equal (github-pulls-nav-level) "issue-comments") (remhash "issue" (github-pulls-nav-state))))
   (github-pulls-init-current-nav-buffer))
 
 ;;; github-pulls.el ends here
